@@ -314,7 +314,7 @@ def init_firestore():
 
     cred = credentials.Certificate('backend/serviceAccountKey.json')
     firebase_admin.initialize_app(cred)
-    logger.info(f"Firebaseを初期化しました (ファイル: {resolved_cred_path})")
+    logger.info(f"Firebaseを初期化しました")
 
     return firestore.client()
 
