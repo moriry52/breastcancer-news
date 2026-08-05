@@ -1,0 +1,46 @@
+name: Daily Breast Cancer News Fetcher
+
+# 1. 起動スケジュールの設定
+on:
+  schedule:
+    # UTC基準（日本時間は +9時間）。
+    # 毎日 UTC 21:00（＝日本時間 翌朝6:00）に実行
+    - cron: '0 21 * * *'
+  # 手動実行ボタン（GitHubの画面からいつでもテスト実行できるボタン）
+  workflow_dispatch:
+
+jobs:
+  run-python-script:
+    runs-on: ubuntu-latest
+
+    steps:
+    # 1. リポジトリのコードを取得
+    - name: Check out repository
+      uses: actions/checkout@v4
+
+    # 2. Python環境のセットアップ
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.10'
+
+    # 3. 依存ライブラリのインストール
+    - name: Install dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r backend/requirements.txt
+
+    # 4. 機密データ（Service Account Key）を環境変数からファイルとして復元
+    - name: Create serviceAccountKey.json
+      env:
+        FIREBASE_KEY: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_KEY }}
+      run: |
+        echo "$FIREBASE_KEY" > backend/serviceAccountKey.json
+
+    # 5. Pythonスクリプトの実行（Gemini API Keyなどを環境変数で渡す）
+    - name: Run Python script
+      env:
+        GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        NCBI_EMAIL: ${{ secrets.NCBI_EMAIL }} # PubMed API用メールアドレス
+      run: |
+        python backend/main.py
