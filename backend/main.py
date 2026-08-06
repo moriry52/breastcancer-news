@@ -268,7 +268,7 @@ Abstract: {art['abstract']}
 
 【評価基準 (合計100点満点)】
 1. 臨床影響度 (0-40点): 明日からの乳がん診療・標準治療・処方選択肢を変えるインパクトがあるか。
-2. 新規性・話題性 (0-30点): ADC, CDK4/6i, 免疫療法, PARP, ctDNA, De-escalationなどトレンドか。
+2. 新規性・話題性 (0-30点): Artificial Intelligence(AI), ADC, CDK4/6i, 免疫療法, PARP, ctDNA, De-escalationなどトレンドか。
 3. 抄読会適合度 (0-30点): 医局のカンファレンスや抄読会でディスカッションを呼ぶ興味深いテーマか。
 
 【全 {len(articles)} 件の論文リスト】
