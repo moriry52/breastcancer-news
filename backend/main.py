@@ -381,8 +381,7 @@ def save_to_firestore(db_client, article: Dict[str, Any], eval_res: EvaluatedArt
         "pub_date": article["pub_date"],
         "authors": article["authors"],
         "doi": article["doi"],
-        "abstract": article["abstract"],
-        
+        # abstract はフロントエンドで不使用のため除外（通信量削減）
         # AI Scored & Generated Fields
         "score": eval_res.score,
         "score_reason": eval_res.score_reason,
