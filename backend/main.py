@@ -6,7 +6,7 @@
 特徴:
 - PubMed API (Bio.Entrez) から直近7日間の「breast cancer」関連論文を収集。
 - Firestoreの既存データと照合し、収集済みの論文 (PMID) は事前重複除外。
-- アブストラクトの有無・文献タイプ (Case Reports/Editorial除外)・主要誌/研究デザインの1次フィルタ。
+- アブストラクトの有無・文献タイプ (Editorial除外)・主要誌/研究デザインの1次フィルタ。
 - Gemini API (google-genai) の超長コンテキストを活用した「全論文一括スコアリング (1 API Call Batch Processing)」:
   - 臨床影響度 (0-40点)
   - 新規性・話題性 (0-30点)
@@ -67,7 +67,7 @@ MAJOR_JOURNALS = [
 ]
 
 EXCLUDED_PUB_TYPES = [
-    "case reports", "editorial", "letter", "comment", "biography",
+    "editorial", "letter", "comment", "biography",
     "published erratum", "retraction of publication", "historical article"
 ]
 
@@ -233,38 +233,15 @@ def primary_filter(article: Dict[str, Any], existing_pmids: set) -> bool:
             logger.debug(f"[Skip] PMID {pmid}: 除外対象文献タイプ '{ex_type}' です。")
             return False
 
-    # 3b. 総説 (Review) の除外: 一般的なReviewは除外、systematic reviewも除外します。
-    # ただし meta-analysis は優遇して残します（meta-analysis を含む場合は除外しない）。
-    if any('review' in pt for pt in pub_types_lower) or any('systematic review' in pt for pt in pub_types_lower):
-        # 例外: meta-analysis を含む場合は残す
-        if 'meta-analysis' not in " ".join(pub_types_lower):
-            logger.debug(f"[Skip] PMID {pmid}: 文献タイプがReview/systematic reviewのため除外します。")
-            return False
-            
+
     # 4. 主要ジャーナルまたは優先研究デザインの優遇判定
     journal_lower = article["journal"].lower()
     is_major_journal = any(mj in journal_lower for mj in MAJOR_JOURNALS)
     is_priority_design = any(any(p_type in pt for pt in pub_types_lower) for p_type in PRIORITY_PUB_TYPES)
 
-    # 4b. 基礎研究 (in vitro / in vivo) を除外するヒューリスティック
-    abstract_lower = (article.get("abstract") or "").lower()
-    BASIC_KEYWORDS = [
-        'in vitro', 'in-vitro', 'cell line', 'cell lines', 'cell culture', 'xenograft',
-        'mouse', 'mice', 'rat', 'rodent', 'murine', 'knockout', 'transgenic', 'preclinical', 'animal model', 'in vivo', 'invivo'
-    ]
-    CLINICAL_INDICATORS = ['human', 'patient', 'patients', 'clinical', 'biopsy', 'specimen', 'cohort', 'tumor tissue', 'tumour tissue']
-
-    if any(kw in abstract_lower for kw in BASIC_KEYWORDS):
-        # 臨床指標が含まれていれば基礎研究ではないとみなす
-        if not any(ci in abstract_lower for ci in CLINICAL_INDICATORS):
-            # 主要ジャーナルや優先研究デザインは除外対象から保護
-            if not is_major_journal and not is_priority_design:
-                logger.debug(f"[Skip] PMID {pmid}: 基礎研究キーワードを検出し除外します ({[k for k in BASIC_KEYWORDS if k in abstract_lower]})")
-                return False
-
     if is_major_journal or is_priority_design or len(article["abstract"]) > 300:
         return True
-        
+
     return True
 
 
@@ -295,6 +272,10 @@ Abstract: {art['abstract']}
 1. 臨床影響度 (0-40点): 明日からの乳がん診療・標準治療・処方選択肢を変えるインパクトがあるか。
 2. 新規性・話題性 (0-30点): Artificial Intelligence(AI), ADC, CDK4/6i, 免疫療法, PARP, ctDNA, De-escalationなどトレンドか。
 3. 抄読会適合度 (0-30点): 医局のカンファレンスや抄読会でディスカッションを呼ぶ興味深いテーマか。
+
+【AI評価で低評価とする論文】
+- 症例報告(case report / case reports)および純粋な基礎研究(in vitro, in vivo, animal model, preclinicalなど)は臨床応用性が低いと判断し、70点未満としてください。
+- 上記論文については、日本語3行要約(summary_3lines)と抄読会用5枚スライド(slides)を生成しないでください。
 
 【全 {len(articles)} 件の論文リスト】
 {articles_formatted_text}
@@ -431,8 +412,12 @@ def save_to_firestore(db_client, article: Dict[str, Any], eval_res: EvaluatedArt
             PAGE_SIZE = 12
             MAX_PAGES = 5  # 最大5ページ分までインデックスを生成
 
-            # Fetch latest articles (up to PAGE_SIZE * MAX_PAGES) ordered by published_at desc
-            articles_ref = db_client.collection("articles").order_by("published_at", direction=firebase_admin_firestore.Query.DESCENDING).limit(PAGE_SIZE * MAX_PAGES)
+            # Fetch latest articles ordered by published_at desc only.
+            # Local sorting by pmid desc avoids the need for a Firestore composite index.
+            articles_ref = db_client.collection("articles")
+            articles_ref = articles_ref.order_by("published_at", direction=firebase_admin_firestore.Query.DESCENDING)
+            articles_ref = articles_ref.limit(PAGE_SIZE * MAX_PAGES)
+
             docs = list(articles_ref.stream())
             # Build list of summary items
             summaries = []
@@ -453,15 +438,34 @@ def save_to_firestore(db_client, article: Dict[str, Any], eval_res: EvaluatedArt
                     "published_at": dd.get("published_at")
                 })
 
+            # Stable local sorting when published_at values are identical.
+            summaries.sort(
+                key=lambda x: (
+                    x.get("published_at", ""),
+                    int(x.get("pmid") or 0) if str(x.get("pmid") or "").isdigit() else 0
+                ),
+                reverse=True
+            )
+
             # Chunk into pages and write each page doc
             for i in range(0, len(summaries), PAGE_SIZE):
                 page_items = summaries[i:i+PAGE_SIZE]
                 page_number = (i // PAGE_SIZE) + 1
                 idx_doc_id = f"page_{page_number}"
                 idx_doc_ref = db_client.collection("articles_index").document(idx_doc_id)
+
+                last_cursor = None
+                if page_items:
+                    last_item = page_items[-1]
+                    last_cursor = {
+                        "published_at": last_item.get("published_at"),
+                        "pmid": last_item.get("pmid")
+                    }
+
                 idx_doc_ref.set({
                     "items": page_items,
                     "page_number": page_number,
+                    "last_cursor": last_cursor,
                     "updated_at": datetime.now()
                 })
         except Exception as ex_idx:
@@ -470,21 +474,88 @@ def save_to_firestore(db_client, article: Dict[str, Any], eval_res: EvaluatedArt
         logger.error(f"Firestoreへの保存中にエラーが発生しました [PMID {article['pmid']}]: {e}")
 
 
+def rebuild_articles_index(db_client, page_size: int = 12, max_pages: int = 5):
+    """Firestore articles_index の page_1 〜 page_N を再構築する"""
+    if not db_client:
+        logger.warning("Firestoreクライアント未設定のため articles_index を再構築できません。")
+        return
+
+    try:
+        articles_ref = db_client.collection("articles")
+        articles_ref = articles_ref.order_by("published_at", direction=firebase_admin_firestore.Query.DESCENDING)
+        docs = list(articles_ref.limit(page_size * max_pages).stream())
+
+        summaries = []
+        for d in docs:
+            dd = d.to_dict()
+            summaries.append({
+                "pmid": dd.get("pmid"),
+                "title": dd.get("title"),
+                "title_ja": dd.get("title_ja"),
+                "journal": dd.get("journal"),
+                "pub_date": dd.get("pub_date"),
+                "authors": dd.get("authors", []),
+                "score": dd.get("score"),
+                "score_reason": dd.get("score_reason"),
+                "category": dd.get("category"),
+                "summary_3lines": dd.get("summary_3lines", []),
+                "slides": dd.get("slides", []),
+                "published_at": dd.get("published_at")
+            })
+
+        summaries.sort(
+            key=lambda x: (
+                x.get("published_at", ""),
+                int(x.get("pmid") or 0) if str(x.get("pmid") or "").isdigit() else 0
+            ),
+            reverse=True
+        )
+
+        for i in range(0, len(summaries), page_size):
+            page_items = summaries[i:i+page_size]
+            page_number = (i // page_size) + 1
+            idx_doc_id = f"page_{page_number}"
+            idx_doc_ref = db_client.collection("articles_index").document(idx_doc_id)
+
+            last_cursor = None
+            if page_items:
+                last_item = page_items[-1]
+                last_cursor = {
+                    "published_at": last_item.get("published_at"),
+                    "pmid": last_item.get("pmid")
+                }
+
+            idx_doc_ref.set({
+                "items": page_items,
+                "page_number": page_number,
+                "last_cursor": last_cursor,
+                "updated_at": datetime.now()
+            })
+
+        logger.info(f"articles_index を再構築しました: page_1〜page_{(len(summaries) + page_size - 1) // page_size}")
+    except Exception as e:
+        logger.warning(f"articles_index の再構築に失敗しました: {e}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Breast Cancer News Batch Processor")
     parser.add_argument("--date", "--end-date", type=str, default=None, help="検索終了日 (YYYY-MM-DD形式。例: 2026-07-15。未指定時は今日)")
     parser.add_argument("--days", type=int, default=7, help="検索対象の遡り日数 (デフォルト: 7日間)")
     parser.add_argument("--limit", type=int, default=30, help="PubMedからの最大取得件数 (デフォルト: 30件)")
     parser.add_argument("--dry-run", action="store_true", help="Firestoreへの保存を行わずローカル出力のみテスト")
+    parser.add_argument("--rebuild-index", action="store_true", help="Firestore articles_index を再構築する")
     args = parser.parse_args()
 
-    api_key = os.environ.get("GEMINI_API_KEY")
-    if not api_key:
-        logger.error("エラー: GEMINI_API_KEY 環境変数が設定されていません。.env ファイルを確認してください。")
-        if not args.dry_run:
-            sys.exit(1)
-
     db_client = None if args.dry_run else init_firestore()
+    if args.rebuild_index:
+        rebuild_articles_index(db_client)
+        return
+
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key and not args.dry_run:
+        logger.error("エラー: GEMINI_API_KEY 環境変数が設定されていません。.env ファイルを確認してください。")
+        sys.exit(1)
+
     existing_pmids = get_existing_pmids_from_firestore(db_client)
 
     # 1. PubMed収集
