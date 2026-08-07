@@ -29,6 +29,7 @@ from Bio import Entrez
 
 # Pydantic for Gemini Batch Structured Output
 from pydantic import BaseModel, Field
+from firebase_admin import firestore as firebase_admin_firestore
 
 # Setup Logging & Encoding for Windows Console compatibility
 if hasattr(sys.stdout, "reconfigure"):
@@ -231,11 +232,35 @@ def primary_filter(article: Dict[str, Any], existing_pmids: set) -> bool:
         if any(ex_type in pt for pt in pub_types_lower):
             logger.debug(f"[Skip] PMID {pmid}: 除外対象文献タイプ '{ex_type}' です。")
             return False
+
+    # 3b. 総説 (Review) の除外: 一般的なReviewは除外、systematic reviewも除外します。
+    # ただし meta-analysis は優遇して残します（meta-analysis を含む場合は除外しない）。
+    if any('review' in pt for pt in pub_types_lower) or any('systematic review' in pt for pt in pub_types_lower):
+        # 例外: meta-analysis を含む場合は残す
+        if 'meta-analysis' not in " ".join(pub_types_lower):
+            logger.debug(f"[Skip] PMID {pmid}: 文献タイプがReview/systematic reviewのため除外します。")
+            return False
             
     # 4. 主要ジャーナルまたは優先研究デザインの優遇判定
     journal_lower = article["journal"].lower()
     is_major_journal = any(mj in journal_lower for mj in MAJOR_JOURNALS)
     is_priority_design = any(any(p_type in pt for pt in pub_types_lower) for p_type in PRIORITY_PUB_TYPES)
+
+    # 4b. 基礎研究 (in vitro / in vivo) を除外するヒューリスティック
+    abstract_lower = (article.get("abstract") or "").lower()
+    BASIC_KEYWORDS = [
+        'in vitro', 'in-vitro', 'cell line', 'cell lines', 'cell culture', 'xenograft',
+        'mouse', 'mice', 'rat', 'rodent', 'murine', 'knockout', 'transgenic', 'preclinical', 'animal model', 'in vivo', 'invivo'
+    ]
+    CLINICAL_INDICATORS = ['human', 'patient', 'patients', 'clinical', 'biopsy', 'specimen', 'cohort', 'tumor tissue', 'tumour tissue']
+
+    if any(kw in abstract_lower for kw in BASIC_KEYWORDS):
+        # 臨床指標が含まれていれば基礎研究ではないとみなす
+        if not any(ci in abstract_lower for ci in CLINICAL_INDICATORS):
+            # 主要ジャーナルや優先研究デザインは除外対象から保護
+            if not is_major_journal and not is_priority_design:
+                logger.debug(f"[Skip] PMID {pmid}: 基礎研究キーワードを検出し除外します ({[k for k in BASIC_KEYWORDS if k in abstract_lower]})")
+                return False
 
     if is_major_journal or is_priority_design or len(article["abstract"]) > 300:
         return True
@@ -401,6 +426,46 @@ def save_to_firestore(db_client, article: Dict[str, Any], eval_res: EvaluatedArt
         # doc IDに pmid を使用して重複書き込みを防ぐ
         db_client.collection("articles").document(article["pmid"]).set(doc_data)
         logger.info(f"Firestore保存成功 [PMID {article['pmid']}] スコア: {eval_res.score}点 ({eval_res.category})")
+        # --- Update page-based lightweight index documents (`articles_index/page_N`) ---
+        try:
+            PAGE_SIZE = 12
+            MAX_PAGES = 5  # 最大5ページ分までインデックスを生成
+
+            # Fetch latest articles (up to PAGE_SIZE * MAX_PAGES) ordered by published_at desc
+            articles_ref = db_client.collection("articles").order_by("published_at", direction=firebase_admin_firestore.Query.DESCENDING).limit(PAGE_SIZE * MAX_PAGES)
+            docs = list(articles_ref.stream())
+            # Build list of summary items
+            summaries = []
+            for d in docs:
+                dd = d.to_dict()
+                summaries.append({
+                    "pmid": dd.get("pmid"),
+                    "title": dd.get("title"),
+                    "title_ja": dd.get("title_ja"),
+                    "journal": dd.get("journal"),
+                    "pub_date": dd.get("pub_date"),
+                    "authors": dd.get("authors", []),
+                    "score": dd.get("score"),
+                    "score_reason": dd.get("score_reason"),
+                    "category": dd.get("category"),
+                    "summary_3lines": dd.get("summary_3lines", []),
+                    "slides": dd.get("slides", []),
+                    "published_at": dd.get("published_at")
+                })
+
+            # Chunk into pages and write each page doc
+            for i in range(0, len(summaries), PAGE_SIZE):
+                page_items = summaries[i:i+PAGE_SIZE]
+                page_number = (i // PAGE_SIZE) + 1
+                idx_doc_id = f"page_{page_number}"
+                idx_doc_ref = db_client.collection("articles_index").document(idx_doc_id)
+                idx_doc_ref.set({
+                    "items": page_items,
+                    "page_number": page_number,
+                    "updated_at": datetime.now()
+                })
+        except Exception as ex_idx:
+            logger.warning(f"articles_index の更新に失敗しました: {ex_idx}")
     except Exception as e:
         logger.error(f"Firestoreへの保存中にエラーが発生しました [PMID {article['pmid']}]: {e}")
 
